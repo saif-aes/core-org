@@ -1,0 +1,74 @@
+
+# Define a 'Service' To Expose mysql to Other Services
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql  # DNS name
+  labels:
+    app: mysql
+    # tier: database
+spec:
+  ports:
+    - port: 3306
+      targetPort: 3306
+  selector:       # mysql Pod Should contain same labels
+    app: mysql
+    # tier: database
+  clusterIP: None  # We Use DNS, Thus ClusterIP is not relevant
+
+---
+
+
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+spec:
+  serviceName: mysql
+  replicas: 3
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      containers:
+      - name: mysql
+        image: mysql:5.7
+        env:
+          - name: MYSQL_ROOT_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: db-secrets
+                key: password
+          - name: MYSQL_DATABASE # Setting Database Name from a 'ConfigMap'
+            valueFrom:
+              configMapKeyRef:
+                name: db-config
+                key: db_name
+        ports:
+        - name: mysql
+          containerPort: 3306
+        volumeMounts:
+        # - name: mysql-persistent-storage
+        - name: mysql-pv-claim
+          mountPath: /var/lib/mysql
+        # command: ["/bin/sh", "-c"]
+        # args:
+        # - "if [[ $(hostname) == mysql-0 ]]; then mysqld --user=mysql --server-id=1 --log-bin=mysql-bin --relay-log=mysql-relay-bin --auto_increment_offset=1 --auto_increment_increment=2; else mysqld --user=mysql --server-id=$(hostname | awk -F'-' '{ print $2+1 }') --read-only=1; fi"
+      # volumes:
+      # - name: mysql-persistent-storage
+      #   persistentVolumeClaim:
+      #     claimName: mysql-pv-claim
+  volumeClaimTemplates:
+  - metadata:
+      name: mysql-pv-claim
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      storageClassName: "standard"
+
+      resources:
+        requests:
+          storage: 1Gi

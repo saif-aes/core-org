@@ -1,0 +1,188 @@
+# application/mysql/mysql-statefulset.yaml
+
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+spec:
+  serviceName: mysql
+  replicas: 3
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      initContainers:
+        - name: init-mysql
+          image: mysql:5.7
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: db-secrets
+                  key: password
+                  
+          command:
+            - bash
+            - "-c"
+            - |
+              set -ex
+              # Generate mysql server-id from pod ordinal index.
+              [[ `hostname` =~ -([0-9]+)$ ]] || exit 1
+              ordinal=${BASH_REMATCH[1]}
+              echo [mysqld] > /mnt/conf.d/server-id.cnf
+              # Add an offset to avoid reserved server-id=0 value.
+              echo server-id=$((100 + $ordinal)) >> /mnt/conf.d/server-id.cnf
+              # Copy appropriate conf.d files from config-map to emptyDir.
+              if [[ $ordinal -eq 0 ]]; then
+                cp /mnt/config-map/master.cnf /mnt/conf.d/
+              else
+                cp /mnt/config-map/slave.cnf /mnt/conf.d/
+              fi
+          volumeMounts:
+            - name: conf
+              mountPath: /mnt/conf.d
+            - name: config-map
+              mountPath: /mnt/config-map
+        - name: mysql-init-slavery
+          image: mysql:5.7
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: db-secrets
+                  key: password
+          command:
+            - bash
+            - "-c"
+            - |
+                set -ex
+                # Generate mysql server-id from pod ordinal index.
+                [[ `hostname` =~ -([0-9]+)$ ]] || exit 1
+                ordinal=${BASH_REMATCH[1]}
+                if [[ $ordinal -eq 0 ]]; then
+                  echo "Skip Replication on master"
+                  # until mysql -h 127.0.0.1 -p"$MYSQL_ROOT_PASSWORD" -e "SELECT 1"; do sleep 100; done
+                  # while mysql -h 127.0.0.1 -p"$MYSQL_ROOT_PASSWORD" -e "SELECT 1"; do sleep 100; done
+                else
+                  echo "Waiting for master mysql to be ready (accepting connections)"
+                  until mysql -h mysql-0.mysql -p"$MYSQL_ROOT_PASSWORD" -e "SELECT 1"; do sleep 1; done
+                  mysqldump -h mysql-0.mysql -p"$MYSQL_ROOT_PASSWORD" --all-databases --master-data > /var/lib/mysql/master.dump
+                  sed -i "s/CHANGE MASTER TO/CHANGE MASTER TO MASTER_HOST='mysql-0.mysql', MASTER_USER='root', MASTER_PASSWORD="$MYSQL_ROOT_PASSWORD", MASTER_CONNECT_RETRY=10,/g" /var/lib/mysql/master.dump
+                  # echo "Waiting for slave mysql to be ready (accepting connections)"
+                  # until mysql -h 127.0.0.1 -p"$MYSQL_ROOT_PASSWORD" -e "SELECT 1"; do sleep 1; done
+                  # mysql -h 127.0.0.1 -p"$MYSQL_ROOT_PASSWORD" \
+                  #       -e "$( < /var/lib/mysql/master.dump); \
+                  #             START SLAVE;" || exit 1
+                  # # backup
+                  # mv /var/lib/mysql/master.dump /var/lib/mysql/master.old-dump 
+                fi
+                echo "Replication completed"
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mysql
+              subPath: mysql
+            - name: conf
+              mountPath: /etc/mysql/conf.d
+        
+      containers:
+        - name: mysql
+          image: mysql:5.7
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: db-secrets
+                  key: password
+          ports:
+            - name: mysql
+              containerPort: 3306
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mysql
+              subPath: mysql
+            - name: conf
+              mountPath: /etc/mysql/conf.d
+          resources:
+            requests:
+              cpu: 500m
+              memory: 200Mi
+          livenessProbe:
+            exec:
+              command:
+                - bash
+                - "-c"
+                - |
+                  mysqladmin ping --password="$MYSQL_ROOT_PASSWORD"
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+          readinessProbe:
+            exec:
+              # Check we can execute queries over TCP (skip-networking is off).
+              command:
+                - bash
+                - "-c"
+                - |
+                  mysql -h 127.0.0.1 --password="$MYSQL_ROOT_PASSWORD" -e "SELECT 1"
+            initialDelaySeconds: 5
+            periodSeconds: 2
+            timeoutSeconds: 1
+        - name: mysql-slavery
+          image: mysql:5.7
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: db-secrets
+                  key: password
+          command:
+            - bash
+            - "-c"
+            - |
+                set -ex
+                # Generate mysql server-id from pod ordinal index.
+                [[ `hostname` =~ -([0-9]+)$ ]] || exit 1
+                ordinal=${BASH_REMATCH[1]}
+                if [[ $ordinal -eq 0 ]]; then
+                  echo "Skip Replication on master"
+                  # mysql -h 127.0.0.1 -p"$MYSQL_ROOT_PASSWORD" -e "SELECT 1"
+                  until mysql -h 127.0.0.1 -p"$MYSQL_ROOT_PASSWORD" --port=3306 -e "SELECT 1"; do sleep 1000; done
+                  while mysql -h 127.0.0.1 -p"$MYSQL_ROOT_PASSWORD" --port=3306 -e "SELECT 1"; do sleep 1000; done
+                else
+                  until mysql -h 127.0.0.1 -p"$MYSQL_ROOT_PASSWORD" --port=3306 -e "SELECT 1"; do sleep 1; done
+                  mysql -h 127.0.0.1 -p"$MYSQL_ROOT_PASSWORD" \
+                        -e "$( < /var/lib/mysql/master.dump); \
+                              START SLAVE;" || exit 1
+                  # backup
+                  mv /var/lib/mysql/master.dump /var/lib/mysql/master.old-dump 
+                fi
+                echo "Replication completed"
+                while mysql -h 127.0.0.1 -p"$MYSQL_ROOT_PASSWORD" --port=3306 -e "SELECT 1"; do sleep 10000; done
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mysql
+              subPath: mysql
+            - name: conf
+              mountPath: /etc/mysql/conf.d
+          resources:
+            requests:
+              cpu: 300m
+              memory: 100Mi
+      volumes:
+        - name: conf
+          emptyDir: {}
+        - name: config-map
+          configMap:
+            name: mysql
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
